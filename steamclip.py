@@ -27,7 +27,7 @@ from PyQt6.QtWidgets import (
     QFrame, QComboBox, QDialog, QTableWidget,
     QTableWidgetItem, QTextEdit, QMessageBox,
     QFileDialog, QLayout, QProgressBar, QHeaderView,
-    QGroupBox, QLineEdit
+    QGroupBox, QLineEdit, QCheckBox
 )
 from PyQt6.QtGui import QPixmap, QIcon, QDesktopServices, QColor, QGuiApplication
 from PyQt6.QtCore import Qt, QUrl, QThread, pyqtSignal
@@ -347,13 +347,14 @@ class YouTubeUploadThread(QThread):
     SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
     TOKEN_FILE = os.path.join(CONFIG_PATH, 'youtube_token.json')
 
-    def __init__(self, clip_folder, title, description, privacy, game_ids):
+    def __init__(self, clip_folder, title, description, privacy, game_ids, apply_hdr_corrections=False):
         super().__init__()
         self.clip_folder = clip_folder
         self.title = title
         self.description = description
         self.privacy = privacy
         self.game_ids = game_ids
+        self.apply_hdr_corrections = apply_hdr_corrections
 
     def run(self):
         temp_mp4 = None
@@ -385,7 +386,11 @@ class YouTubeUploadThread(QThread):
             intermediate.append(concat_video)
             concat_audio = helper.concatenate_media_files(audio_files, is_video=False)
             intermediate.append(concat_audio)
-            output_mp4 = helper.generate_and_merge_final_file(concat_video, concat_audio, self.clip_folder)
+            
+            if self.apply_hdr_corrections:
+                output_mp4 = self._merge_with_hdr_corrections(concat_video, concat_audio)
+            else:
+                output_mp4 = helper.generate_and_merge_final_file(concat_video, concat_audio, self.clip_folder)
             return output_mp4
         finally:
             for f in intermediate:
@@ -394,6 +399,24 @@ class YouTubeUploadThread(QThread):
                         os.unlink(f)
                     except Exception:
                         pass
+    
+    def _merge_with_hdr_corrections(self, video_path, audio_path):
+        """Merge video and audio with HDR color corrections applied."""
+        output_file = os.path.join(tempfile.gettempdir(), f"youtube_upload_{os.getpid()}_{hash(self.clip_folder)}.mp4")
+        ffmpeg_path = iio.get_ffmpeg_exe()
+        subprocess_args = {'check': True}
+        if IS_WINDOWS:
+            subprocess_args['creationflags'] = subprocess.CREATE_NO_WINDOW
+        
+        logger("Applying HDR colour corrections for YouTube upload")
+        subprocess.run([
+            ffmpeg_path, '-i', video_path, '-i', audio_path,
+            '-vf', 'scale=in_color_matrix=bt2020:out_color_matrix=bt709,eq=contrast=1.3:brightness=0.03:saturation=1.4',
+            '-c:v', 'libx264', '-crf', '18', '-preset', 'medium',
+            '-c:a', 'copy', output_file
+        ], **subprocess_args)
+        
+        return output_file
 
     def _get_youtube_client(self):
         if not YOUTUBE_AVAILABLE:
@@ -2012,6 +2035,11 @@ class YouTubeShareDialog(QDialog):
         self.privacy_combo.addItems(["Unlisted", "Private", "Public"])
         layout.addWidget(self.privacy_combo)
 
+        # HDR Corrections
+        self.hdr_corrections_checkbox = QCheckBox("Apply HDR colour corrections when converting")
+        self.hdr_corrections_checkbox.setChecked(False)
+        layout.addWidget(self.hdr_corrections_checkbox)
+
         # Progress bar (hidden until upload starts)
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
@@ -2068,8 +2096,9 @@ class YouTubeShareDialog(QDialog):
         self.progress_bar.setValue(0)
         self.progress_bar.setFormat("Preparing...")
 
+        apply_hdr = self.hdr_corrections_checkbox.isChecked()
         self.upload_thread = YouTubeUploadThread(
-            self.clip_folder, title, description, privacy, parent.game_ids
+            self.clip_folder, title, description, privacy, parent.game_ids, apply_hdr
         )
         self.upload_thread.progress_update.connect(self._on_progress)
         self.upload_thread.finished_signal.connect(self._on_finished)
@@ -2094,6 +2123,7 @@ class YouTubeShareDialog(QDialog):
         self.title_input.setEnabled(enabled)
         self.desc_input.setEnabled(enabled)
         self.privacy_combo.setEnabled(enabled)
+        self.hdr_corrections_checkbox.setEnabled(enabled)
 
     def closeEvent(self, event):
         if self.upload_thread and self.upload_thread.isRunning():
