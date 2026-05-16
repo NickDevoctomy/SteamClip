@@ -27,10 +27,20 @@ from PyQt6.QtWidgets import (
     QFrame, QComboBox, QDialog, QTableWidget,
     QTableWidgetItem, QTextEdit, QMessageBox,
     QFileDialog, QLayout, QProgressBar, QHeaderView,
-    QGroupBox
+    QGroupBox, QLineEdit, QCheckBox
 )
 from PyQt6.QtGui import QPixmap, QIcon, QDesktopServices, QColor, QGuiApplication
 from PyQt6.QtCore import Qt, QUrl, QThread, pyqtSignal
+
+try:
+    from googleapiclient.discovery import build as yt_build
+    from google_auth_oauthlib.flow import InstalledAppFlow
+    from google.oauth2.credentials import Credentials
+    from google.auth.transport.requests import Request as GoogleRequest
+    from googleapiclient.http import MediaFileUpload
+    YOUTUBE_AVAILABLE = True
+except ImportError:
+    YOUTUBE_AVAILABLE = False
 
 DEBUG = '-debug' in sys.argv
 IS_WINDOWS = sys.platform == 'win32'
@@ -329,6 +339,154 @@ class ConversionThread(QThread):
             counter += 1
         return unique_filename
 
+
+class YouTubeUploadThread(QThread):
+    progress_update = pyqtSignal(str, int)
+    finished_signal = pyqtSignal(bool, str)
+
+    SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
+    TOKEN_FILE = os.path.join(CONFIG_PATH, 'youtube_token.json')
+
+    def __init__(self, clip_folder, title, description, privacy, game_ids, apply_hdr_corrections=False):
+        super().__init__()
+        self.clip_folder = clip_folder
+        self.title = title
+        self.description = description
+        self.privacy = privacy
+        self.game_ids = game_ids
+        self.apply_hdr_corrections = apply_hdr_corrections
+
+    def run(self):
+        temp_mp4 = None
+        try:
+            self.progress_update.emit("Converting clip...", 5)
+            temp_mp4 = self._convert_to_temp_mp4()
+            self.progress_update.emit("Authenticating with YouTube...", 20)
+            youtube = self._get_youtube_client()
+            self._upload(youtube, temp_mp4)
+            self.finished_signal.emit(True, "Clip uploaded to YouTube successfully!")
+        except Exception as exc:
+            logger(f"YouTube upload failed: {exc}", exc_info=exc)
+            self.finished_signal.emit(False, str(exc))
+        finally:
+            if temp_mp4 and os.path.exists(temp_mp4):
+                try:
+                    os.unlink(temp_mp4)
+                    logger(f"Deleted YouTube temp file: {temp_mp4}")
+                except Exception:
+                    pass
+
+    def _convert_to_temp_mp4(self):
+        helper = ConversionThread([self.clip_folder], tempfile.gettempdir(), self.game_ids)
+        session_mpd_files = helper.find_session_mpd_files(self.clip_folder)
+        video_files, audio_files = helper.prepare_temp_media_files(session_mpd_files)
+        intermediate = list(video_files) + list(audio_files)
+        try:
+            concat_video = helper.concatenate_media_files(video_files, is_video=True)
+            intermediate.append(concat_video)
+            concat_audio = helper.concatenate_media_files(audio_files, is_video=False)
+            intermediate.append(concat_audio)
+            
+            if self.apply_hdr_corrections:
+                output_mp4 = self._merge_with_hdr_corrections(concat_video, concat_audio)
+            else:
+                output_mp4 = helper.generate_and_merge_final_file(concat_video, concat_audio, self.clip_folder)
+            return output_mp4
+        finally:
+            for f in intermediate:
+                if f and os.path.exists(f):
+                    try:
+                        os.unlink(f)
+                    except Exception:
+                        pass
+    
+    def _merge_with_hdr_corrections(self, video_path, audio_path):
+        """Merge video and audio with HDR color corrections applied."""
+        output_file = os.path.join(tempfile.gettempdir(), f"youtube_upload_{os.getpid()}_{hash(self.clip_folder)}.mp4")
+        ffmpeg_path = iio.get_ffmpeg_exe()
+        subprocess_args = {'check': True}
+        if IS_WINDOWS:
+            subprocess_args['creationflags'] = subprocess.CREATE_NO_WINDOW
+        
+        logger("Applying HDR colour corrections for YouTube upload")
+        subprocess.run([
+            ffmpeg_path, '-i', video_path, '-i', audio_path,
+            '-vf', 'scale=in_color_matrix=bt2020:out_color_matrix=bt709,eq=contrast=1.3:brightness=0.03:saturation=1.4',
+            '-c:v', 'libx264', '-crf', '18', '-preset', 'medium',
+            '-c:a', 'copy', output_file
+        ], **subprocess_args)
+        
+        return output_file
+
+    def _get_youtube_client(self):
+        if not YOUTUBE_AVAILABLE:
+            raise RuntimeError(
+                "YouTube packages are not installed.\n"
+                "Run: pip install google-api-python-client google-auth-oauthlib google-auth-httplib2"
+            )
+        client_id = os.environ.get('YOUTUBE_CLIENT_ID')
+        client_secret = os.environ.get('YOUTUBE_CLIENT_SECRET')
+        if not client_id or not client_secret:
+            raise RuntimeError(
+                "YouTube credentials not configured.\n\n"
+                "Please set the YOUTUBE_CLIENT_ID and YOUTUBE_CLIENT_SECRET environment variables.\n"
+                "See the README for setup instructions."
+            )
+        creds = None
+        token_file = self.TOKEN_FILE
+        if os.path.exists(token_file):
+            try:
+                creds = Credentials.from_authorized_user_file(token_file, self.SCOPES)
+            except Exception as exc:
+                logger(f"Failed to load YouTube token: {exc}")
+        if not creds or not creds.valid:
+            if creds and creds.expired and creds.refresh_token:
+                try:
+                    creds.refresh(GoogleRequest())
+                except Exception as exc:
+                    logger(f"Token refresh failed, re-authenticating: {exc}")
+                    creds = None
+            if not creds:
+                client_config = {
+                    "installed": {
+                        "client_id": client_id,
+                        "client_secret": client_secret,
+                        "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                        "token_uri": "https://oauth2.googleapis.com/token",
+                        "redirect_uris": ["urn:ietf:wg:oauth:2.0:oob", "http://localhost"]
+                    }
+                }
+                flow = InstalledAppFlow.from_client_config(client_config, self.SCOPES)
+                creds = flow.run_local_server(port=0)
+            os.makedirs(os.path.dirname(token_file), exist_ok=True)
+            with open(token_file, 'w') as f:
+                f.write(creds.to_json())
+            logger("YouTube token saved.")
+        return yt_build('youtube', 'v3', credentials=creds)
+
+    def _upload(self, youtube, mp4_path):
+        body = {
+            'snippet': {
+                'title': self.title,
+                'description': self.description,
+                'categoryId': '20'
+            },
+            'status': {
+                'privacyStatus': self.privacy
+            }
+        }
+        media = MediaFileUpload(mp4_path, mimetype='video/mp4', resumable=True, chunksize=1024 * 1024)
+        request = youtube.videos().insert(part='snippet,status', body=body, media_body=media)
+        response = None
+        while response is None:
+            status, response = request.next_chunk()
+            if status:
+                pct = int(status.progress() * 75) + 25
+                self.progress_update.emit(f"Uploading... {int(status.progress() * 100)}%", pct)
+        video_id = response.get('id', '')
+        logger(f"YouTube upload complete. Video ID: {video_id}")
+
+
 class SteamClipApp(QWidget):
     CONFIG_DIR = CONFIG_PATH
     CONFIG_FILE = os.path.join(CONFIG_DIR, 'SteamClip.conf')
@@ -425,6 +583,7 @@ class SteamClipApp(QWidget):
         # Bottom Layout
         self.convert_button = self.create_button("Convert Clip(s)", self.convert_clip, enabled=False)
         self.convert_button.setProperty("class", "primary")
+        self.youtube_button = self.create_button("Share to YouTube", self.share_to_youtube, enabled=False)
         self.exit_button = self.create_button("Exit", self.close)
         self.exit_button.setProperty("class", "secondary")
         self.prev_button = self.create_button("<< Previous", self.show_previous_clips)
@@ -434,6 +593,7 @@ class SteamClipApp(QWidget):
         self.bottom_layout.addWidget(self.prev_button)
         self.bottom_layout.addWidget(self.next_button)
         self.bottom_layout.addWidget(self.convert_button)
+        self.bottom_layout.addWidget(self.youtube_button)
         self.bottom_layout.addWidget(self.exit_button)
         self.main_layout.addLayout(self.bottom_layout)
         self.setLayout(self.main_layout)
@@ -1068,6 +1228,7 @@ class SteamClipApp(QWidget):
             if widget and hasattr(widget, 'folder'):
                 widget.setStyleSheet("border: none;")
         self.convert_button.setEnabled(False)
+        self.youtube_button.setEnabled(False)
         self.clear_selection_button.setEnabled(False)
 
     def populate_steamid_dirs(self):
@@ -1351,6 +1512,7 @@ class SteamClipApp(QWidget):
             self.selected_clips.add(folder)
             container.setStyleSheet("border: 3px solid #66c0f4; border-radius: 4px;")
         self.convert_button.setEnabled(bool(self.selected_clips))
+        self.youtube_button.setEnabled(len(self.selected_clips) == 1)
         self.clear_selection_button.setEnabled(len(self.selected_clips) >= 1)
 
     def update_navigation_buttons(self):
@@ -1387,6 +1549,7 @@ class SteamClipApp(QWidget):
 
     def toggle_interface(self, enabled):
         self.convert_button.setEnabled(enabled and bool(self.selected_clips))
+        self.youtube_button.setEnabled(enabled and len(self.selected_clips) == 1)
         self.export_all_button.setEnabled(enabled and bool(self.clip_folders))
         self.clear_selection_button.setEnabled(enabled and bool(self.selected_clips))
         self.prev_button.setEnabled(enabled and self.clip_index > 0)
@@ -1465,6 +1628,14 @@ class SteamClipApp(QWidget):
     def export_all(self):
         logger("User clicked Export All.")
         self.process_clips(export_all=True)
+
+    def share_to_youtube(self):
+        logger("User clicked Share to YouTube.")
+        if len(self.selected_clips) != 1:
+            return
+        clip_folder = next(iter(self.selected_clips))
+        dialog = YouTubeShareDialog(self, clip_folder)
+        dialog.exec()
 
     @staticmethod
     def find_session_mpd(clip_folder):
@@ -1806,6 +1977,163 @@ class EditGameIDWindow(QDialog):
         QMessageBox.information(self, "Info", "Game names saved successfully.")
         logger("Game ID names edited and saved.")
         self.accept()
+
+
+class YouTubeShareDialog(QDialog):
+    def __init__(self, parent: 'SteamClipApp', clip_folder: str):
+        super().__init__(parent)
+        self.clip_folder = clip_folder
+        self.upload_thread = None
+        self.setWindowTitle("Share to YouTube")
+        self.setWindowIcon(QIcon('SteamClip.ico'))
+        self.setFixedWidth(420)
+
+        layout = QVBoxLayout()
+        layout.setSpacing(10)
+
+        # Thumbnail
+        thumbnail_path = os.path.join(clip_folder, 'thumbnail.jpg')
+        thumb_label = QLabel()
+        thumb_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        if os.path.exists(thumbnail_path):
+            pixmap = QPixmap(thumbnail_path).scaled(
+                380, 215, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation
+            )
+            thumb_label.setPixmap(pixmap)
+        else:
+            thumb_label.setText("No thumbnail available")
+            thumb_label.setFixedHeight(60)
+        layout.addWidget(thumb_label)
+
+        # Clip name
+        folder_name = os.path.basename(clip_folder)
+        clip_name_label = QLabel(folder_name)
+        clip_name_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(clip_name_label)
+
+        # Title
+        layout.addWidget(QLabel("Title:"))
+        self.title_input = QLineEdit()
+        self.title_input.setPlaceholderText("Video title")
+        parts = folder_name.split('_')
+        game_name = parent.get_game_name(parts[1]) if len(parts) > 1 else ""
+        date_str = self._parse_date(parts)
+        pre_fill = f"{game_name} - {date_str}" if game_name and date_str else folder_name
+        self.title_input.setText(pre_fill)
+        layout.addWidget(self.title_input)
+
+        # Description
+        layout.addWidget(QLabel("Description:"))
+        self.desc_input = QTextEdit()
+        self.desc_input.setFixedHeight(80)
+        self.desc_input.setPlaceholderText("Optional description")
+        layout.addWidget(self.desc_input)
+
+        # Privacy
+        layout.addWidget(QLabel("Privacy:"))
+        self.privacy_combo = QComboBox()
+        self.privacy_combo.addItems(["Unlisted", "Private", "Public"])
+        layout.addWidget(self.privacy_combo)
+
+        # HDR Corrections
+        self.hdr_corrections_checkbox = QCheckBox("Apply HDR colour corrections when converting")
+        self.hdr_corrections_checkbox.setChecked(False)
+        layout.addWidget(self.hdr_corrections_checkbox)
+
+        # Progress bar (hidden until upload starts)
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setVisible(False)
+        self.progress_bar.setFixedHeight(25)
+        self.progress_bar.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.progress_bar)
+
+        # Buttons
+        btn_layout = QHBoxLayout()
+        self.upload_button = QPushButton("Upload to YouTube")
+        self.upload_button.setProperty("class", "primary")
+        self.upload_button.setFixedHeight(40)
+        self.upload_button.clicked.connect(self._start_upload)
+        self.cancel_button = QPushButton("Cancel")
+        self.cancel_button.setFixedHeight(40)
+        self.cancel_button.clicked.connect(self.reject)
+        btn_layout.addWidget(self.upload_button)
+        btn_layout.addWidget(self.cancel_button)
+        layout.addLayout(btn_layout)
+
+        self.setLayout(layout)
+
+    @staticmethod
+    def _parse_date(parts):
+        if len(parts) >= 3:
+            try:
+                dt = datetime.strptime(parts[-2] + parts[-1], "%Y%m%d%H%M%S")
+                return dt.strftime("%Y-%m-%d")
+            except ValueError:
+                pass
+        return ""
+
+    def _start_upload(self):
+        title = self.title_input.text().strip()
+        if not title:
+            QMessageBox.warning(self, "Missing Title", "Please enter a title for the video.")
+            return
+        if not os.environ.get('YOUTUBE_CLIENT_ID') or not os.environ.get('YOUTUBE_CLIENT_SECRET'):
+            QMessageBox.critical(
+                self, "YouTube Not Configured",
+                "YouTube credentials are not set.\n\n"
+                "Please set the YOUTUBE_CLIENT_ID and YOUTUBE_CLIENT_SECRET\n"
+                "environment variables before uploading.\n\n"
+                "See the README for setup instructions."
+            )
+            return
+
+        privacy = self.privacy_combo.currentText().lower()
+        description = self.desc_input.toPlainText()
+        parent = self.parent()
+
+        self._set_inputs_enabled(False)
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFormat("Preparing...")
+
+        apply_hdr = self.hdr_corrections_checkbox.isChecked()
+        self.upload_thread = YouTubeUploadThread(
+            self.clip_folder, title, description, privacy, parent.game_ids, apply_hdr
+        )
+        self.upload_thread.progress_update.connect(self._on_progress)
+        self.upload_thread.finished_signal.connect(self._on_finished)
+        self.upload_thread.start()
+
+    def _on_progress(self, message, value):
+        self.progress_bar.setFormat(message)
+        self.progress_bar.setValue(value)
+
+    def _on_finished(self, success, message):
+        if success:
+            QMessageBox.information(self, "Upload Complete", message)
+            self.accept()
+        else:
+            QMessageBox.critical(self, "Upload Failed", f"Upload failed:\n\n{message}")
+            self._set_inputs_enabled(True)
+            self.progress_bar.setVisible(False)
+
+    def _set_inputs_enabled(self, enabled):
+        self.upload_button.setEnabled(enabled)
+        self.cancel_button.setEnabled(enabled)
+        self.title_input.setEnabled(enabled)
+        self.desc_input.setEnabled(enabled)
+        self.privacy_combo.setEnabled(enabled)
+        self.hdr_corrections_checkbox.setEnabled(enabled)
+
+    def closeEvent(self, event):
+        if self.upload_thread and self.upload_thread.isRunning():
+            event.ignore()
+        else:
+            event.accept()
+
+    def parent(self) -> Optional['SteamClipApp']:
+        return super().parent()
+
 
 STEAM_DARK_QSS = """
 QWidget { background-color: #1b2838; color: #c7d5e0; font-family: "Segoe UI", "Roboto", "Helvetica Neue", sans-serif; font-size: 14px; }
